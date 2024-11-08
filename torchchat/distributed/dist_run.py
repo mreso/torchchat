@@ -270,7 +270,7 @@ def _decode_in_flight(token, tokenizer, tp_rank):
     token_str = tokenizer.decode(token.tolist())
     # print the token string on tp rank 0
     if tp_rank == 0:
-        logger.info(
+        logger.debug(
             f"{color.green} responses ====>>>> "
             f"{color.blue} {token_str} {color.reset}"
         )
@@ -407,7 +407,7 @@ def main(
         return example_inputs, example_outputs
 
     # Create prefill stage
-    logger.info(f"Creating pipeline stage for prefill {pp_rank=}, {pp_degree=}")
+    logger.debug(f"Creating pipeline stage for prefill {pp_rank=}, {pp_degree=}")
     example_inputs, example_outputs = get_example_ins_outs(seqlen_prefill)
     prefill_stage = PipelineStage(
         model,
@@ -445,7 +445,7 @@ def main(
             assert (
                 len(input_ids) == batch_size
             ), f"Expecting {batch_size=} prompts but got {len(input_ids)=}"
-            logger.info(f"{color.green}Input_ids: {input_ids}{color.reset}")
+            logger.debug(f"{color.green}Input_ids: {input_ids}{color.reset}")
 
             start_pos = 0
             # Setup input position (input_pos) for prefill: a list of increasing integers from 0 to seqlen
@@ -476,18 +476,18 @@ def main(
             else:  # middle pp ranks
                 prefiller.step(**kwargs)
 
-        logger.info(
+        logger.debug(
             f"{color.green}Prefilling time: {timer.get_time()} {timer.unit} for rank {rank}{color.reset}"
         )
 
         # Decode the output -- first generated token
         if pp_rank == last_pp_rank:
-            logger.info(f"{color.green}Decoding...{prompt_lengths=}{color.reset}")
+            logger.debug(f"{color.green}Decoding...{prompt_lengths=}{color.reset}")
             new_token = _batch_decode_next_tokens(output, prompt_lengths)
             res.append(new_token)
             # TODO: Move to a separate decoding thread
             resp = _decode_in_flight(new_token, tokenizer, tp_rank)
-            pipe.send((resp, new_token.tolist()))
+            pipe.send((resp, new_token.to("cpu")))
         else:
             pipe.send(None)
 
@@ -496,7 +496,7 @@ def main(
         input_pos = torch.tensor([prompt_lengths[0]], device=device)
 
         # Create decode stage
-        logger.info(f"Creating pipeline stage for decode {pp_rank=}, {pp_degree=}")
+        logger.debug(f"Creating pipeline stage for decode {pp_rank=}, {pp_degree=}")
         example_inputs, example_outputs = get_example_ins_outs(seqlen_decode)
         decode_stage = PipelineStage(
             model,
@@ -552,14 +552,14 @@ def main(
                     res.append(new_token)
                     # TODO: Move to a separate decoding thread
                     resp = _decode_in_flight(new_token, tokenizer, tp_rank)
-                    pipe.send((resp, new_token))
+                    pipe.send((resp, new_token.to("cpu")))
                 else:
                     pipe.send(None)
 
                 # Increment input position
                 input_pos += 1
 
-        logger.info(
+        logger.debug(
             f"{color.green}Decoding time: {timer.get_time()} {timer.unit} for rank {rank}{color.reset}"
         )
 
@@ -579,12 +579,12 @@ def main(
 
             # Show prompts and responses
             for prompt_text, response_text in zip(prompt, responses):
-                logger.info(f"Prompt: {color.green}{prompt_text} {color.reset}")
-                logger.info(f"Response: {color.red}{response_text} {color.reset}")
+                logger.debug(f"Prompt: {color.green}{prompt_text} {color.reset}")
+                logger.debug(f"Response: {color.red}{response_text} {color.reset}")
 
     # Cleanup
     _cleanup()
-    logger.info(
+    logger.debug(
         f"{color.green}Success{color.white} - {color.blue}Rank {rank} has completed.{color.reset}"
     )
 

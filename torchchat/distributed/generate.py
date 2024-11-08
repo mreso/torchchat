@@ -5,22 +5,23 @@
 # LICENSE file in the root directory of this source tree.
 import asyncio
 import atexit
-import importlib.util
-import subprocess
 import threading
-from abc import abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
 from os import environ
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
+from typing_extensions import override
 from uuid import uuid4
 
+import torch
 import torch.multiprocessing as mp
+
 from torchchat.cli.builder import BuilderArgs, TokenizerArgs
 from torchchat.distributed.dist_run import NAME_TO_DISTRIBUTION_AND_DTYPE
 from torchchat.distributed.logging_utils import SingletonLogger
+from torchchat.model import Model
 from torchchat.utils.generator import Generator, GeneratorArgs
 
 logger = SingletonLogger.get_logger()
@@ -53,6 +54,7 @@ def _launch_distributed_inference(
     procs = []
     try:
         for rank in range(num_processes_per_node):
+            #TODO: Replace against Queues to support GPU tensors
             server_pipe, client_pipe = mp.Pipe(duplex=True)
             pipes.append(server_pipe)
             procs.append(
@@ -127,7 +129,6 @@ class Scheduler(object):
                 break
             self.requests = {req.request_id: req.prompt}
 
-            responses = {}
             running = True
             while running:
                 outputs = self.step()
@@ -241,9 +242,27 @@ class DistributedGenerator(Generator):
         for p in self.procs:
             p.kill()
 
-    def generate(self, text):
+    @override
+    def generate(
+        self,
+        prompt: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        chat_mode: bool,
+        batch: Optional[
+            Dict[str, Any]
+        ] = None,  # List of Image prompt tensors for multimodal models
+        start_pos: int = 0,
+        draft_model: Model,
+        speculate_k: Optional[int] = 8,
+        sequential_prefill=True,
+        callback=lambda x: x,
+        max_seq_length: int,
+        seed: Optional[int] = None,
+        **sampling_kwargs,
+    ):
         # Function to generate text from prompt
-        req = Request.new_request(text)
+        req = Request.new_request(prompt)
         self.scheduler.schedule_request(req)
 
         generator = self.scheduler.wait_for_request(req)
@@ -268,5 +287,10 @@ class DistributedGenerator(Generator):
             )
         elif self.builder_args.chpt_from == "torchchat":
             raise ValueError(
-                f"Distributed inference currently only supports HF checkpoints"
+                "Distributed inference currently only supports HF checkpoints"
             )
+    
+    @override
+    def is_text_only(self) -> bool:
+        #TODO: Implement vision model
+        return True

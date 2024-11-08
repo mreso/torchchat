@@ -441,21 +441,17 @@ def main(
             else:
                 raise ValueError(f"Unknown command: {command}")
         else:
-            prompt = command
+            input_ids = command
             assert (
-                len(prompt) == batch_size
-            ), f"Expecting {batch_size=} prompts but got {len(prompt)=}"
-            logger.info(f"{color.green}Prompt: {prompt}{color.reset}")
+                len(input_ids) == batch_size
+            ), f"Expecting {batch_size=} prompts but got {len(input_ids)=}"
+            logger.info(f"{color.green}Input_ids: {input_ids}{color.reset}")
 
             start_pos = 0
             # Setup input position (input_pos) for prefill: a list of increasing integers from 0 to seqlen
             input_pos = torch.arange(seqlen_prefill, device=device)
 
-        # encode the prompt
-        input_ids = _encode_strings(
-            prompt, tokenizer, bos=True, device=device, dtype=torch.int64
-        )
-
+        input_ids = [ids.to(device) for ids in input_ids]
         # create a padded tensor for the input prompt
         padded_sequence, prompt_lengths = _create_padded_prompts(
             input_ids, tokenizer, seqlen_prefill, start_pos, device
@@ -578,6 +574,8 @@ def main(
             res_list = res.tolist()
 
             responses = tokenizer.decode(res_list)
+
+            prompt = [tokenizer.decode(ids.tolist()) for ids in input_ids]
 
             # Show prompts and responses
             for prompt_text, response_text in zip(prompt, responses):

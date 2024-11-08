@@ -21,6 +21,7 @@ from torchchat.cli.builder import (
     BuilderArgs,
     TokenizerArgs,
 )
+from torchchat.model import Model, ModelType
 
 # torchtune model definition dependencies
 from torchtune.data import Message, padded_collate_tiled_images_and_mask
@@ -229,6 +230,27 @@ class Generator(object):
                 )
         else:
             self.chat_formatter = Llama2ChatFormatter(self.tokenizer)
+
+    @abstractmethod
+    def generate(
+        self,
+        prompt: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        chat_mode: bool,
+        batch: Optional[
+            Dict[str, Any]
+        ] = None,  # List of Image prompt tensors for multimodal models
+        start_pos: int = 0,
+        draft_model: Model,
+        speculate_k: Optional[int] = 8,
+        sequential_prefill=True,
+        callback=lambda x: x,
+        max_seq_length: int,
+        seed: Optional[int] = None,
+        **sampling_kwargs,
+    ) -> torch.Tensor:
+        raise NotImplementedError()
 
     @abstractmethod
     def is_text_only(self) -> bool:

@@ -392,7 +392,6 @@ class OpenAiApiGenerator(LocalGenerator):
         ILLEGAL_CHAR = '\ufffd'
         # Process each token, metrics tuple yielded by Generator.generate.
         for y, _ in self.generate(
-            model=self.model,
             prompt=encoded,
             max_new_tokens=generator_args.max_new_tokens,
             draft_model=self.draft_model,

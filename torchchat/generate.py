@@ -114,6 +114,9 @@ class LocalGenerator(Generator):
         generator_args.validate_build(self.builder_args)
         generator_args.validate_build(self.speculative_builder_args, "draft model")
 
+        if generator_args.compile:
+            self.apply_compile_to_models(generator_args)
+
     def multinomial_sample_one_no_sync(
         self,
         probs_sort,
@@ -380,10 +383,10 @@ class LocalGenerator(Generator):
             next_token = self.multinomial_sample_one_no_sync(new)
             return torch.cat([draft_tokens[:accept_length], next_token])
 
+    @override
     @torch.no_grad()
     def generate(
         self,
-        model: Model,
         prompt: torch.Tensor,
         max_new_tokens: int,
         *,
@@ -415,28 +418,28 @@ class LocalGenerator(Generator):
         max_new_tokens = min(max_new_tokens, max_seq_length - start_pos - prompt_length)
         # set up caches only if first inference
         if start_pos == 0:
-            model = model.to(device=device)
+            self.model = self.model.to(device=device)
             with torch.device(device):
                 if (
                     self.is_torchtune_model
                     or self.model.config.model_type == ModelType.Flamingo
                 ):
                     # 6404 is one-gpu affordable max_seq_length for single image input
-                    model.setup_caches(
+                    self.model.setup_caches(
                         batch_size=1,
                         dtype=self.dtype,
                         encoder_max_seq_len=6404,
                         decoder_max_seq_len=max_seq_length,
                     )
                 else:
-                    model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
-                if is_speculative and draft_model is not model:
+                    self.model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+                if is_speculative and draft_model is not self.model:
                     draft_model.setup_caches(
                         max_batch_size=1,
                         max_seq_length=max_seq_length,
                     )
-            if model.config.model_type == ModelType.Flamingo:
-                model.reset_caches()
+            if self.model.config.model_type == ModelType.Flamingo:
+                self.model.reset_caches()
 
         input_pos = torch.arange(
             start_pos, prompt_length + start_pos, device=device, dtype=torch.int
@@ -444,7 +447,7 @@ class LocalGenerator(Generator):
 
         prefill_t0 = time.perf_counter()
         next_token = self.prefill(
-            model,
+            self.model,
             prompt.view(1, -1),
             input_pos,
             batch=batch,
@@ -480,7 +483,7 @@ class LocalGenerator(Generator):
                 cur_token = next_token.view(())
 
                 next_tokens = self.speculative_decode(
-                    model,
+                    self.model,
                     draft_model,
                     cur_token,
                     input_pos,
@@ -499,7 +502,7 @@ class LocalGenerator(Generator):
         else:
             generated_tokens = []
             for generated_token, _ in self.decode_n_tokens(
-                model,
+                self.model,
                 next_token,
                 input_pos,
                 max_new_tokens - 1,
@@ -555,49 +558,6 @@ class LocalGenerator(Generator):
                 for p in itertools.chain(self.model.parameters(), self.model.buffers())
             ]
         )
-        if generator_args.compile:
-            if (
-                self.is_speculative and self.builder_args.use_distributed
-            ):  # and ("cuda" in builder_args.device):
-                torch._inductor.config.triton.cudagraph_trees = (
-                    False  # Bug with cudagraph trees in this case
-                )
-
-            if self.builder_args.device == "cpu":
-                if generator_args.max_autotune:
-                    kwargs = {"mode": "max-autotune"}
-                else:
-                    kwargs = {}
-            else:
-                kwargs = {"mode": "reduce-overhead"}
-
-            if self.is_speculative:
-                self.model_forward = torch.compile(
-                    self.model_forward, fullgraph=True, **kwargs
-                )
-
-            if self.model.config.model_type == ModelType.Flamingo:
-                # Based on https://github.com/pytorch/torchtune/blob/57ab583c84c4a9dcacac23aeabc81f2a679670fe/torchtune/training/_compile.py#L42-L52
-                from torchtune.modules import (
-                    TransformerCrossAttentionLayer,
-                    TransformerSelfAttentionLayer,
-                )
-
-                decoder = self.model.model.decoder
-                for m in reversed(list(decoder.modules())):
-                    if isinstance(m, TransformerSelfAttentionLayer) or isinstance(
-                        m, TransformerCrossAttentionLayer
-                    ):
-                        m.compile()
-            else:
-                self.decode_one_token = torch.compile(
-                    self.decode_one_token, fullgraph=True, **kwargs
-                )
-
-            if generator_args.compile_prefill:
-                self.prefill = torch.compile(
-                    self.prefill, fullgraph=True, dynamic=True, **kwargs
-                )
 
         self.system_prompt = None
         # Set up our max_seq_length
@@ -743,7 +703,6 @@ class LocalGenerator(Generator):
             num_tokens_generated = 0
             with prof:
                 generator_func = self.generate(
-                    self.model,
                     encoded,
                     generator_args.max_new_tokens,
                     draft_model=self.draft_model,
@@ -849,6 +808,50 @@ with {'sequential' if generator_args.sequential_prefill else 'parallel'} prefill
     def is_text_only(self) -> bool:
         return self.model.config.model_type != ModelType.Flamingo
 
+    def apply_compile_to_models(self, generator_args: GeneratorArgs):
+        if (
+            self.is_speculative and self.builder_args.use_distributed
+        ):  # and ("cuda" in builder_args.device):
+            torch._inductor.config.triton.cudagraph_trees = (
+                False  # Bug with cudagraph trees in this case
+            )
+
+        if self.builder_args.device == "cpu":
+            if generator_args.max_autotune:
+                kwargs = {"mode": "max-autotune"}
+            else:
+                kwargs = {}
+        else:
+            kwargs = {"mode": "reduce-overhead"}
+
+        if self.is_speculative:
+            self.model_forward = torch.compile(
+                self.model_forward, fullgraph=True, **kwargs
+            )
+
+        if self.model.config.model_type == ModelType.Flamingo:
+            # Based on https://github.com/pytorch/torchtune/blob/57ab583c84c4a9dcacac23aeabc81f2a679670fe/torchtune/training/_compile.py#L42-L52
+            from torchtune.modules import (
+                TransformerCrossAttentionLayer,
+                TransformerSelfAttentionLayer,
+            )
+
+            decoder = self.model.model.decoder
+            for m in reversed(list(decoder.modules())):
+                if isinstance(m, TransformerSelfAttentionLayer) or isinstance(
+                    m, TransformerCrossAttentionLayer
+                ):
+                    m.compile()
+        else:
+            self.decode_one_token = torch.compile(
+                self.decode_one_token, fullgraph=True, **kwargs
+            )
+
+        if generator_args.compile_prefill:
+            self.prefill = torch.compile(
+                self.prefill, fullgraph=True, dynamic=True, **kwargs
+            )
+
 
 def main(args):
     builder_args = BuilderArgs.from_args(args)
@@ -881,8 +884,17 @@ def main(args):
             args.draft_quantize,
         )
 
+        encoded, batch = dist_gen._gen_model_input(generator_args.prompt)
+
         response = ""
-        for output in dist_gen.generate(generator_args.prompt):
+        output_generator = dist_gen.generate(
+            encoded.to("cpu"),
+            generator_args.max_new_tokens,
+            chat_mode=generator_args.chat_mode,
+            draft_model=None,
+            max_seq_length=2048,
+            )
+        for output in output_generator:
             response += output.text
 
         print(f"Model output: {response}")

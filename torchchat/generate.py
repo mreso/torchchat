@@ -9,6 +9,7 @@ import logging
 import textwrap
 import time
 
+from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from typing_extensions import override
@@ -26,7 +27,7 @@ from torchchat.cli.builder import (
 )
 from torchchat.distributed.generate import DistributedGenerator
 from torchchat.model import Model, ModelType
-from torchchat.utils.build_utils import device_sync, set_precision
+from torchchat.utils.build_utils import set_precision
 from torchchat.utils.device_info import get_device_info
 from torchchat.utils.generator import Generator, GeneratorArgs, E_INST, B_INST, E_SYS, B_SYS
 
@@ -395,7 +396,6 @@ class LocalGenerator(Generator):
             Dict[str, Any]
         ] = None,  # List of Image prompt tensors for multimodal models
         start_pos: int = 0,
-        draft_model: Model,
         speculate_k: Optional[int] = 8,
         sequential_prefill=True,
         callback=lambda x: x,
@@ -409,7 +409,7 @@ class LocalGenerator(Generator):
         if seed:
             torch.manual_seed(seed)
 
-        is_speculative = draft_model is not None
+        is_speculative = self.draft_model is not None
         device = prompt.device
 
         if len(prompt.shape) > 1:
@@ -433,8 +433,8 @@ class LocalGenerator(Generator):
                     )
                 else:
                     self.model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
-                if is_speculative and draft_model is not self.model:
-                    draft_model.setup_caches(
+                if is_speculative and self.draft_model is not self.model:
+                    self.draft_model.setup_caches(
                         max_batch_size=1,
                         max_seq_length=max_seq_length,
                     )
@@ -456,7 +456,7 @@ class LocalGenerator(Generator):
         )
         if is_speculative:
             self.prefill(
-                draft_model,
+                self.draft_model,
                 prompt.view(1, -1),
                 input_pos,
                 sequential_prefill=sequential_prefill,
@@ -484,7 +484,7 @@ class LocalGenerator(Generator):
 
                 next_tokens = self.speculative_decode(
                     self.model,
-                    draft_model,
+                    self.draft_model,
                     cur_token,
                     input_pos,
                     speculate_k,
@@ -524,289 +524,37 @@ class LocalGenerator(Generator):
             "accept_counts": accept_counts,
         }
         yield None, generate_stats
+    
+    @override
+    def is_text_only(self) -> bool:
+        return self.model.config.model_type != ModelType.Flamingo
 
-    def _callback(self, x, *, buffer, done_generating):
-        # TODO: Refactor this callback to only include basic functionality & remove print statements
-        period_id = self.tokenizer.encode(".")[0]
-        buffer.append(
-            self.tokenizer.decode([period_id] + x.tolist())[1:]
-        )  # I think this results in the first output token being dropped from the display which is wrong.
-        if x.item() == self.tokenizer.eos_id():
-            done_generating = True
-        if (
-            self.is_llama3_model
-            and x.item() == self.tokenizer.special_tokens["<|eot_id|>"]
-        ):
-            done_generating = True
-            buffer = buffer[:-1]  # drop the eot_id from the output buffer
-        if len(buffer) == 4 or done_generating:
-            print("".join(buffer), end="", flush=True)
-            buffer.clear()
-        # print(, end='', flush=True)
-
-
-    def chat(
-        self,
-        generator_args: GeneratorArgs,
-    ):
-        if generator_args.chat_mode:
-            print("Starting Interactive Chat")
-
-        model_size = sum(
-            [
-                p.numel() * p.dtype.itemsize
-                for p in itertools.chain(self.model.parameters(), self.model.buffers())
-            ]
-        )
-
-        self.system_prompt = None
-        # Set up our max_seq_length
-
+    @override
+    @property
+    def max_seq_length(self) -> int:
+        """
+        Returns the maximum sequence length supported by the model.
+        """
         # This is a hack to get around the fact that different models have different ways to record their max_seq_length and might be wrong
         # TODO: unify the max_seq_length config representation.
         text_transformer_args = self.model.text_transformer_args
         max_seq_length = (
             text_transformer_args.max_seq_length if text_transformer_args else 2048
         )
-
-        encoded, batch = self._gen_model_input(
-            generator_args.prompt,
-            generator_args.image_prompts,
-            generator_args.max_new_tokens,
-            max_seq_length,
-        )
-
-        if generator_args.chat_mode:
-            print(
-                f"Entering Chat Mode. Will continue chatting back and forth with the language model until the models max context length of {max_seq_length} tokens is hit or until the user says /bye"
-            )
-            get_system_prompt = input(
-                "Do you want to enter a system prompt? Enter y for yes and anything else for no. \n"
-            )
-            if get_system_prompt == "y" or get_system_prompt == "Y":
-                self.system_prompt = input("What is your system prompt? \n")
-
-        # `is_torchtune_model` is a misnomer since it doesn't capture all
-        # torchtune models (i.e. Flamingo)
-        # See Issue: https://github.com/pytorch/torchchat/issues/1273
-        elif (
-            not generator_args.is_torchtune_model
-            and self.model.config.model_type != ModelType.Flamingo
-        ):
-            max_seq_length = min(
-                encoded.size(0) + generator_args.max_new_tokens,
-                (
-                    text_transformer_args.block_size
-                    if text_transformer_args is not None
-                    else 2048
-                ),
-                max_seq_length,
-            )
-
-        if self.draft_model is not None:
-            max_seq_length += self.speculative_builder_args.speculate_k + 1
-
-        aggregate_metrics = {
-            "tokens_per_sec": [],
-            "first_token_per_sec": [],
-            "next_tokens_per_sec": [],
-            "accept_counts": [],
-        }
-        start_pos = 0
-
-        # arbitrarily large number as chat mode goes until max_seq length
-        # or user exits
-        num_samples = (
-            generator_args.num_samples if not generator_args.chat_mode else 100000
-        )
-        for i in range(num_samples):
-            device_sync(device=self.builder_args.device)
-            if generator_args.chat_mode:
-                prompt = input("User: ")
-                if prompt == "/bye":
-                    print("Exiting Chat.\n")
-                    break
-                if not self.is_llama3_model:
-                    if self.system_prompt:
-                        prompt = f"{B_INST} {B_SYS}\n{self.system_prompt.strip()}\n{E_SYS}\n\n{prompt.strip()} {E_INST}"
-                        self.system_prompt = (
-                            None  # can only provide system prompt on first interaction
-                        )
-                    else:
-                        prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-                    encoded = self.encode_tokens(
-                        prompt, bos=True, device=self.builder_args.device
-                    )
-                else:
-                    if self.system_prompt:
-                        encoded = self.chat_formatter.encode_dialog_prompt(
-                            [
-                                {"role": "system", "content": self.system_prompt},
-                                {"role": "user", "content": prompt},
-                            ]
-                        )
-                        self.system_prompt = None
-                    elif i == 0:
-                        encoded = self.chat_formatter.encode_dialog_prompt(
-                            [{"role": "user", "content": prompt}]
-                        )
-                    else:
-                        encoded = self.chat_formatter.encode_message(
-                            {"role": "user", "content": prompt}
-                        )
-                        encoded.extend(self.chat_formatter.encode_header("assistant"))
-                    encoded = torch.tensor(
-                        encoded, dtype=torch.int, device=self.builder_args.device
-                    )
-                if encoded.size(0) + start_pos > max_seq_length:
-                    print(
-                        "This prompt would take us past the max_seq_length. Ending Conversation."
-                    )
-                    break
-
-                print("Model: ", end="")
-
-                buffer = []
-
-                def callback(x, *, done_generating=False):
-                    return self._callback(
-                        x,
-                        buffer=buffer,
-                        done_generating=done_generating,
-                    )
-
-            else:
-                assert not generator_args.chat_mode
-
-                buffer = [generator_args.prompt]
-
-                def callback(x, *, done_generating=False):
-                    return self._callback(
-                        x,
-                        buffer=buffer,
-                        done_generating=done_generating,
-                    )
-
-            if self.profile:
-                torch._inductor.config.profiler_mark_wrapper_call = True
-                torch._inductor.config.cpp.enable_kernel_profile = True
-            if (i != generator_args.num_samples - 1 or not self.profile) or (
-                self.builder_args.use_distributed and self.rank != 0
-            ):
-                import contextlib
-
-                prof = contextlib.nullcontext()
-            else:
-                torch.profiler._utils._init_for_cuda_graphs()
-                prof = torch.profiler.profile()
-            t0 = time.perf_counter()
-            num_tokens_generated = 0
-            with prof:
-                generator_func = self.generate(
-                    encoded,
-                    generator_args.max_new_tokens,
-                    draft_model=self.draft_model,
-                    speculate_k=generator_args.speculate_k,
-                    chat_mode=generator_args.chat_mode,
-                    batch=batch,
-                    callback=callback,
-                    temperature=generator_args.temperature,
-                    top_k=generator_args.top_k,
-                    sequential_prefill=generator_args.sequential_prefill,
-                    start_pos=start_pos,
-                    max_seq_length=max_seq_length,
-                )
-                for token_tensor, metrics in generator_func:
-                    if token_tensor is not None:
-                        start_pos += token_tensor.size(0)
-                        num_tokens_generated += token_tensor.size(0)
-                    if metrics is not None:
-                        aggregate_metrics.update(metrics)
-                    yield token_tensor, metrics
-            jit_compile = (i == 0) and (
-                generator_args.compile or generator_args.compile_prefill
-            )
-            compilation_time = time.perf_counter() - t0
-            device_sync(device=self.builder_args.device)
-            t = time.perf_counter() - t0
-            if hasattr(prof, "export_chrome_trace"):
-                if self.builder_args.device == "cpu":
-                    print(prof.key_averages().table(sort_by="self_cpu_time_total"))
-                else:
-                    print(prof.key_averages().table(sort_by="self_cuda_time_total"))
-                if self.builder_args.use_distributed:
-                    prof.export_chrome_trace(f"{self.profile}_rank_{self.rank}.json")
-                else:
-                    prof.export_chrome_trace(f"{self.profile}.json")
-
-            if start_pos >= max_seq_length:
-                print(
-                    f"[Max Sequence Length {max_seq_length} Reached. Ending Conversation.]"
-                )
-                print("---------------------------------------------------")
-
-            tokens_sec = (num_tokens_generated + 1) / t
-            first_token_sec = 1 / aggregate_metrics.get("time_to_first_token", 0)
-            next_tokens_sec = num_tokens_generated / (
-                t - aggregate_metrics.get("time_to_first_token", 0)
-            )
-
-            if jit_compile:
-                print(
-                    f"just-in-time compilation time (incl run time): {compilation_time:.2} seconds"
-                )
-            aggregate_metrics["tokens_per_sec"].append(tokens_sec)
-            aggregate_metrics["first_token_per_sec"].append(first_token_sec)
-            aggregate_metrics["next_tokens_per_sec"].append(next_tokens_sec)
-
-            logging.info(
-                f"\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\
-                \nGenerated {num_tokens_generated} tokens \
-                \nTime for inference {i + 1}: {t:.04f} sec total \
-                \nTime to first token: {aggregate_metrics.get('time_to_first_token', 0):.04f} sec \
-with {'sequential' if generator_args.sequential_prefill else 'parallel'} prefill.\
-                \n\n      Total throughput: {tokens_sec:.04f} tokens/sec, {1 / tokens_sec:.04f} s/token \
-                \nFirst token throughput: {first_token_sec:.04f} tokens/sec, {1 / first_token_sec:.04f} s/token \
-                \n Next token throughput: {next_tokens_sec:.04f} tokens/sec, {1 / next_tokens_sec:.04f} s/token \
-                    "
-            )
-            logging.info(
-                f"\nBandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
-            )
-            if i == 0:
-                logging.info(
-                    f"*** This first iteration will include cold start effects for dynamic import, hardware caches{', JIT compilation' if jit_compile else ''}. ***"
-                )
-            print("\n========================================\n")
-            if start_pos >= max_seq_length:
-                if generator_args.chat_mode:
-                    break
-
-            if not generator_args.chat_mode:
-                start_pos = 0
-
-        if self.is_speculative:
-            counts_aggregated = [
-                sum(i) for i in zip(*aggregate_metrics["accept_counts"])
-            ]
-            acceptance_probs = [i / sum(counts_aggregated) for i in counts_aggregated]
-            print(f"Acceptance probs: {acceptance_probs}")
-            print(
-                f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}"
-            )
-
-        print(
-            f"\n      Average tokens/sec (total): {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f} \
-                \nAverage tokens/sec (first token): {torch.mean(torch.tensor(aggregate_metrics['first_token_per_sec'])).item():.2f} \
-                \nAverage tokens/sec (next tokens): {torch.mean(torch.tensor(aggregate_metrics['next_tokens_per_sec'])).item():.2f} \n\
-                "
-        )
-        if torch.cuda.is_available():
-            print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+        return max_seq_length
     
     @override
-    def is_text_only(self) -> bool:
-        return self.model.config.model_type != ModelType.Flamingo
+    @property
+    def model_size(self) -> int:
+        """
+        Returns the size of the model 
+        """
+        return sum(
+            [
+                p.numel() * p.dtype.itemsize
+                for p in itertools.chain(self.model.parameters(), self.model.buffers())
+            ]
+        )
 
     def apply_compile_to_models(self, generator_args: GeneratorArgs):
         if (
@@ -852,29 +600,20 @@ with {'sequential' if generator_args.sequential_prefill else 'parallel'} prefill
                 self.prefill, fullgraph=True, dynamic=True, **kwargs
             )
 
+def create_generator(
+    args: Namespace,
+) -> Generator:
+    """
+    Factory function to create a Generator object.
+    """
 
-def main(args):
     builder_args = BuilderArgs.from_args(args)
     speculative_builder_args = BuilderArgs.from_speculative_args(args)
     tokenizer_args = TokenizerArgs.from_args(args)
     generator_args = GeneratorArgs.from_args(args)
-    if not builder_args.distributed:
-        gen = LocalGenerator(
-            builder_args,
-            speculative_builder_args,
-            tokenizer_args,
-            generator_args,
-            args.profile,
-            args.quantize,
-            args.draft_quantize,
-        )
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
 
-        for _ in gen.chat(generator_args):
-            pass
-    else:
-        dist_gen = DistributedGenerator(
+    if builder_args.distributed:
+        return DistributedGenerator(
             args.model,
             builder_args,
             tokenizer_args,
@@ -882,20 +621,28 @@ def main(args):
             args.profile,
             args.quantize,
             args.draft_quantize,
-        )
-
-        encoded, batch = dist_gen._gen_model_input(generator_args.prompt)
-
-        response = ""
-        output_generator = dist_gen.generate(
-            encoded.to("cpu"),
-            generator_args.max_new_tokens,
-            chat_mode=generator_args.chat_mode,
-            draft_model=None,
-            max_seq_length=2048,
             )
-        for output in output_generator:
-            response += output.text
+    else:
+        return LocalGenerator(
+            builder_args,
+            speculative_builder_args,
+            tokenizer_args,
+            generator_args,
+            args.profile,
+            args.quantize,
+            args.draft_quantize,
+            )
 
-        print(f"Model output: {response}")
-        dist_gen.shutdown()
+
+def main(args):
+    gen = create_generator(args)
+
+    generator_args = GeneratorArgs.from_args(args)
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    for _ in gen.chat(generator_args):
+        pass
+    
+    gen.shutdown()

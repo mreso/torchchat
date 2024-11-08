@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pwd import getpwuid
 from typing import Any, Dict, List, Optional, Union
+from typing_extensions import override
 
 import torch
 
@@ -281,19 +282,7 @@ class OpenAiApiGenerator(LocalGenerator):
         """
 
         super().__init__(*args, **kwargs)
-        try:
-            self.max_seq_length = (
-                self.model.text_transformer_args.max_seq_length
-                + self.speculative_builder_args.speculate_k
-                + 1
-                if self.draft_model is not None
-                else self.model.text_transformer_args.max_seq_length
-            )
-        except:
-            self.max_seq_length = 2048
-            print(
-                f"can not find max_seq_length in model config, use default value: {self.max_seq_length}"
-            )
+        
         # The System fingerprint is a unique identifier for the model and its configuration.
         self.system_fingerprint = (
             f"{self.builder_args.device}_{self.builder_args.precision}"
@@ -483,6 +472,23 @@ class OpenAiApiGenerator(LocalGenerator):
 
     def _callback(self, x, *, buffer, done_generating):
         pass
+
+    @override
+    @property
+    def max_seq_length(self) -> int:
+        try:
+            return (
+                self.model.text_transformer_args.max_seq_length
+                + self.speculative_builder_args.speculate_k
+                + 1
+                if self.draft_model is not None
+                else self.model.text_transformer_args.max_seq_length
+            )
+        except:
+            print(
+                f"can not find max_seq_length in model config, use default value: {self.max_seq_length}"
+            )
+            return 2048
 
 
 """

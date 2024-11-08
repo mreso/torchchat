@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 import asyncio
 import atexit
+import time
 import threading
+
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
@@ -21,7 +23,6 @@ import torch.multiprocessing as mp
 from torchchat.cli.builder import BuilderArgs, TokenizerArgs
 from torchchat.distributed.dist_run import NAME_TO_DISTRIBUTION_AND_DTYPE
 from torchchat.distributed.logging_utils import SingletonLogger
-from torchchat.model import Model
 from torchchat.utils.generator import Generator, GeneratorArgs
 
 logger = SingletonLogger.get_logger()
@@ -103,6 +104,8 @@ class Scheduler(object):
         generator_args,
         pipes,
         loop,
+        eos_id,
+        eot_id,
     ):
         self.builder_args = builder_args
         self.generator_args = generator_args
@@ -114,6 +117,8 @@ class Scheduler(object):
         self.req_to_results = {}
         self.request_queue = mp.Queue()
         self.loop = loop
+        self.eos_id = eos_id
+        self.eot_id = eot_id
 
     def schedule_request(self, req: Request):
         # add request to queue and create deque and async event for response
@@ -176,17 +181,25 @@ class Scheduler(object):
         # Filter out None responses from in-between stages
         responses = [r for r in responses if r is not None][0]
         outputs = []
+
+        stopping_criteria = [
+            lambda _: self.current_step >= self.generator_args.max_new_tokens - 1,
+            lambda x: x.item() == self.eos_id or (
+                    self.eot_id is not None and x.item() == self.eot_id
+                )
+        ]
+
         for k, v in zip(self.in_flight_batch_order, zip(responses[0], responses[1])):
             text, token_ids = v
             outputs.append(
                 Output(
-                    # TODO: Look for tokenizer.eos_id as well
-                    is_finished=self.current_step >= self.generator_args.max_new_tokens,
+                    is_finished=any(sc(token_ids) for sc in stopping_criteria),
                     text=text,
                     token=token_ids,
                 )
             )
-        if self.current_step >= self.generator_args.max_new_tokens:
+        #TODO: Support batch_size > 1
+        if outputs[0].is_finished:
             for p in self.pipes:
                 p.send("stop")
             self.in_flight_requests = []
@@ -222,7 +235,10 @@ class DistributedGenerator(Generator):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
-        self.scheduler = Scheduler(builder_args, generator_args, self.pipes, self.loop)
+        eos_id=self.tokenizer.eos_id() if self.tokenizer else 2
+        eot_id= self.tokenizer.special_tokens["<|eot_id|>"] if self.is_llama3_model else None
+                 
+        self.scheduler = Scheduler(builder_args, generator_args, self.pipes, self.loop, eos_id, eot_id)
 
         # TODO: Mode into process and use pipe or queue for comm
         self.scheduler_thread = threading.Thread(
@@ -253,7 +269,6 @@ class DistributedGenerator(Generator):
             Dict[str, Any]
         ] = None,  # List of Image prompt tensors for multimodal models
         start_pos: int = 0,
-        draft_model: Model,
         speculate_k: Optional[int] = 8,
         sequential_prefill=True,
         callback=lambda x: x,
@@ -262,24 +277,26 @@ class DistributedGenerator(Generator):
         **sampling_kwargs,
     ):
         # Function to generate text from prompt
-        req = Request.new_request(prompt)
+        req = Request.new_request(prompt.to("cpu"))
         self.scheduler.schedule_request(req)
 
         generator = self.scheduler.wait_for_request(req)
 
         running = True
         while running:
+            t0 = time.perf_counter()
             output = self.loop.run_until_complete(generator.__anext__())
+            
             running &= not output.is_finished
 
-            yield output
+            t_delta = time.perf_counter() - t0
+
+            callback(output.token, done_generating=output.is_finished)
+
+            yield output.token, {"time_to_first_token": t_delta} if start_pos == 0 else None
 
     def check_args(self):
-        if self.generate_args.chat_mode:
-            raise NotImplementedError(
-                "Currently we only support generate with --distributed"
-            )
-        elif self.builder_args.tp < 2:
+        if self.builder_args.tp < 2:
             raise ValueError("TP degree must be at least 2 for distributed inference")
         elif self.model_name not in NAME_TO_DISTRIBUTION_AND_DTYPE.keys():
             raise ValueError(
@@ -294,3 +311,15 @@ class DistributedGenerator(Generator):
     def is_text_only(self) -> bool:
         #TODO: Implement vision model
         return True
+
+    @override
+    @property
+    def max_seq_length(self) -> int:
+        #TODO: Implement a mechanism to get max seq length 
+        return 2048
+
+    @override
+    @property
+    def model_size(self) -> int:
+        #TODO: Calculate model size
+        return 1
